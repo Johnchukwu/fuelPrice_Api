@@ -1,0 +1,358 @@
+# NG Fuel Prices API
+
+An Express + MongoDB service for managing Nigerian fuel station data and publishing customer‑facing pump prices.
+
+---
+
+## Features
+
+* Stations directory with geo/brand filters
+* Price records per station & product (PMS, AGO, DPK, CNG)
+* “Latest effective” listing with pagination & sorting
+* Price history per station
+* Bulk CSV upload for prices (admin)
+* JWT auth (bearer) for admin writes
+* OpenAPI/Swagger spec
+
+---
+
+## Quick start
+
+### Requirements
+
+* Node.js 18+
+* MongoDB 6+
+* Yarn or npm
+
+### Environment
+
+Create **.env** (or export equivalents):
+
+```
+PORT=3000
+MONGO_URL=mongodb://localhost:27017/fuelprice
+JWT_ACCESS_SECRET=your_access_secret
+JWT_REFRESH_SECRET=your_refresh_secret
+CORS_ORIGINS=http://localhost:5173,http://localhost:3000
+BASE_PATH=/fuelprice
+```
+
+> **Note**: `BASE_PATH` is the URL prefix used in the examples below.
+
+### Install & run
+
+```
+yarn install
+yarn dev     # or: npm run dev
+```
+
+OpenAPI docs (if wired in your app) at: `http://localhost:3000/docs`
+
+---
+
+## Data model
+
+### Station (collection: `stations`)
+
+* `_id` (ObjectId)
+* `name` (string)
+* `brand` (string)
+* `state` (string)
+* `lga` (string)
+* `address` (string)
+* `lat` (number)
+* `lng` (number)
+* `services` (string\[]) e.g. `["atm","car_wash"]`
+
+**Indexes**
+
+* `{ state: 1, brand: 1 }` (recommended)
+* Geo index optional if doing radius search
+
+### Price (collection: `prices`)
+
+* `_id` (ObjectId)
+* `station_id` (ObjectId → stations.\_id)
+* `product_type` (`PMS|AGO|DPK|CNG`)
+* `price_per_liter` (number)
+* `currency` (string, default `NGN`)
+* `effective_from` (Date)
+* `source` (string)
+* `is_admin_override` (boolean)
+* `reason` (string, optional)
+* `attachment_url` (string, optional)
+* `createdAt` / `updatedAt`
+
+**Indexes**
+
+* `{ station_id: 1, product_type: 1, effective_from: -1 }` (recommended)
+
+> The API returns only the most recent **effective** (<= now in Africa/Lagos) price per station/product when listing.
+
+---
+
+## Auth
+
+### Register → Verify → Login
+
+```
+POST /fuelprice/auth/register
+POST /fuelprice/auth/verify
+POST /fuelprice/auth/login  # -> { access_token, refresh_token }
+```
+
+Use the `access_token` as a Bearer token for admin endpoints:
+
+```
+Authorization: Bearer <ACCESS_TOKEN>
+```
+
+Refresh / logout:
+
+```
+POST /fuelprice/auth/refresh
+POST /fuelprice/auth/logout
+```
+
+---
+
+## Endpoints
+
+### Stations
+
+```
+GET  /fuelprice/stations
+POST /fuelprice/stations           (admin)
+PATCH /fuelprice/stations/{id}     (admin)
+```
+
+**Query params (GET):** `state`, `lga`, `brand`, `services`, `lat`, `lng`, `radius_km`
+
+### Prices (public reads)
+
+```
+GET /fuelprice/prices
+GET /fuelprice/prices/{stationId}/history
+GET /fuelprice/prices/station/{stationId}/current
+```
+
+**Query params (GET /prices):**
+
+* `product_type` — PMS|AGO|DPK|CNG
+* `state`, `lga`, `brand` — filters on joined station
+* `station_id` — narrow to one station
+* `sort` — e.g. `-price_per_liter` (default)
+* `page`, `limit` — pagination (limit ≤ 100)
+
+**Query params (GET /prices/station/{id}/current):**
+
+* `product_type` — default `PMS`
+
+### Prices (admin writes)
+
+```
+POST  /fuelprice/prices                # create one
+PATCH /fuelprice/prices/{priceId}      # update only if future-effective
+POST  /fuelprice/prices/bulk           # CSV upload (multipart/form-data)
+```
+
+**Validation rules**
+
+* Reject updating records whose `effective_from <= now` (only future-effective can be patched)
+* On create, `station_id`, `product_type`, `price_per_liter`, `effective_from`, `source` are required
+
+**Bulk CSV**
+
+* Form field name: **file**
+* Optional `?dry_run=true` to validate without writing
+* Columns (header required):
+
+  * `station_id` (24-char hex)
+  * `product_type` (PMS|AGO|DPK|CNG)
+  * `price_per_liter` (number)
+  * `effective_from` (ISO datestamp)
+  * `reason` (string)
+  * `source` (string)
+  * `attachment_url` (optional URL)
+
+**Example CSV**
+
+```
+station_id,product_type,price_per_liter,effective_from,reason,source,attachment_url
+68a9971e92336bb40b917ed8,PMS,915,2025-08-25T08:00:00Z,brand defaults,seed,
+68a9971e92336bb40b917ed7,PMS,880,2025-08-25T08:00:00Z,brand defaults,seed,
+```
+
+---
+
+## cURL examples
+
+### Login
+
+```bash
+LOGIN=$(curl -s http://localhost:3000/fuelprice/auth/login \
+  -H 'content-type: application/json' \
+  -d '{"email":"you@example.com","password":"StrongPassphrase123"}')
+TOKEN=$(echo "$LOGIN" | jq -r .access_token)
+```
+
+### List latest Lagos PMS prices (first page, 100 per page)
+
+```bash
+curl -s "http://localhost:3000/fuelprice/prices?state=Lagos&product_type=PMS&limit=100&page=1" | jq .
+```
+
+### One station’s current price
+
+```bash
+SID=68a9971e92336bb40b917ed8
+curl -s "http://localhost:3000/fuelprice/prices/station/$SID/current?product_type=PMS" | jq .
+```
+
+### Price history for a station
+
+```bash
+curl -s "http://localhost:3000/fuelprice/prices/$SID/history?product_type=PMS&limit=5" | jq .
+```
+
+### Bulk upload (dry-run)
+
+```bash
+curl -s -X POST "http://localhost:3000/fuelprice/prices/bulk?dry_run=true" \
+  -H "authorization: Bearer $TOKEN" \
+  -F "file=@data/lagos-pms-prices.csv" | jq .
+```
+
+### Bulk upload (commit)
+
+```bash
+curl -s -X POST "http://localhost:3000/fuelprice/prices/bulk" \
+  -H "authorization: Bearer $TOKEN" \
+  -F "file=@data/lagos-pms-prices.csv" | jq .
+```
+
+---
+
+## Frontend quickstart
+
+### Plain fetch (list latest Lagos PMS)
+
+```ts
+const API = "http://localhost:3000/fuelprice";
+
+async function fetchLagosPms(page = 1, limit = 20) {
+  const qs = new URLSearchParams({ state: "Lagos", product_type: "PMS", page: String(page), limit: String(limit) });
+  const res = await fetch(`${API}/prices?${qs.toString()}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+fetchLagosPms(1, 10).then(({ data, pagination }) => {
+  console.log("rows", data);
+});
+```
+
+### React hook + component (TypeScript)
+
+```tsx
+import { useEffect, useState } from "react";
+
+const API = "http://localhost:3000/fuelprice";
+
+export function useStationCurrentPrice(stationId: string, product: "PMS"|"AGO"|"DPK"|"CNG" = "PMS") {
+  const [data, setData] = useState<any | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    fetch(`${API}/prices/station/${stationId}/current?product_type=${product}`)
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+      .then(json => alive && setData(json.data))
+      .catch(e => alive && setError(String(e)))
+      .finally(() => alive && setLoading(false));
+    return () => { alive = false; };
+  }, [stationId, product]);
+
+  return { data, loading, error };
+}
+
+export function StationPriceCard({ stationId }: { stationId: string }) {
+  const { data, loading, error } = useStationCurrentPrice(stationId, "PMS");
+  if (loading) return <div>Loading…</div>;
+  if (error) return <div>Error: {error}</div>;
+  if (!data) return <div>No price found</div>;
+  return (
+    <div className="card">
+      <h3>{data.station_name} ({data.brand})</h3>
+      <p>
+        <strong>{data.product_type}</strong>: ₦{data.price_per_liter.toLocaleString()} per litre
+      </p>
+      <small>Effective: {new Date(data.effective_from).toLocaleString()} • Source: {data.source}</small>
+    </div>
+  );
+}
+```
+
+### Using axios with auth (admin bulk upload)
+
+```ts
+import axios from "axios";
+
+const API = "http://localhost:3000/fuelprice";
+const token = localStorage.getItem("access_token");
+
+async function bulkUpload(file: File, dryRun = true) {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await axios.post(`${API}/prices/bulk?dry_run=${dryRun}`, form, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  return res.data;
+}
+```
+
+---
+
+## Sorting & pagination
+
+* `sort` supports `+field` or `-field` (descending). Default: `-price_per_liter`
+* `page` ≥ 1; `limit` ∈ \[1, 100]
+
+---
+
+## Error responses
+
+Errors use RFC 7807 Problem Details where appropriate:
+
+```json
+{
+  "type": "about:blank",
+  "title": "Validation Error",
+  "status": 400,
+  "detail": "file is required",
+  "instance": "/fuelprice/prices/bulk?dry_run=true",
+  "correlation_id": "..."
+}
+```
+
+---
+
+## Timezone semantics
+
+“Latest” filtering uses Africa/Lagos current time (`nowLagos()`), i.e., only prices with `effective_from <= now` are returned in listings and `current` endpoint.
+
+---
+
+## Swagger
+
+This repo exports a spec in `src/docs/swagger.ts`. If you mount Swagger UI at `/docs`, consumers can explore parameters, schemas, and try requests in the browser. Add the bulk endpoint, auth security scheme, and models as shown in that file.
+
+---
+
+## Notes / roadmap
+
+* (Optional) Idempotent bulk by `(station_id, product_type, effective_from)` can be enforced via an application check or a unique partial index.
+* Add brand defaults and scheduled updates if you ingest feeds.
+* Add caching headers/ETags on list responses if needed for CDN.
